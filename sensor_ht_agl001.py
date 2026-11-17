@@ -909,7 +909,6 @@ class W100ClimateEntity(BaseThermostat, ZclPlatformEntity):
                 ],
             }
         )
-        self.maybe_emit_state_changed_event()
 
     async def async_set_temperature(
         self,
@@ -941,7 +940,6 @@ class W100ClimateEntity(BaseThermostat, ZclPlatformEntity):
             return
 
         await self._cluster.write_attributes(attributes)
-        self.maybe_emit_state_changed_event()
 
     async def async_set_fan_mode(self, fan_mode: str) -> None:
         """Set fan mode."""
