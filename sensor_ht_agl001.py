@@ -32,7 +32,6 @@ from zha.application.platforms.climate.const import (
     FAN_OFF,
     ZCL_TEMP,
     ClimateEntityFeature,
-    HVACAction,
     HVACMode,
 )
 from zha.application.platforms.number.const import NumberMode
@@ -47,7 +46,7 @@ from zigpy.zcl import (
     AttributeWrittenEvent,
     foundation,
 )
-from zigpy.zcl.clusters.hvac import Fan, FanMode, SystemMode, Thermostat
+from zigpy.zcl.clusters.hvac import Fan, Thermostat
 from zigpy.zcl.clusters.measurement import TemperatureMeasurement
 from zigpy.zcl.foundation import (
     BaseAttributeDefs,
@@ -151,13 +150,6 @@ class W100PowerConfigurationCluster(XiaomiPowerConfigurationPercent):
                 self.send_default_rsp(hdr, foundation.Status.SUCCESS)
             return
         super().handle_cluster_general_request(hdr, args, dst_addressing=dst_addressing)
-
-
-def _build_w100_frame(payload: bytes, action: int) -> bytes:
-    """Build a W100 command_raw frame."""
-    prefix = bytes((0xAA, 0x71, len(payload) + 3, 0x44, 0x00))
-    checksum = (-sum(prefix)) & 0xFF
-    return prefix + bytes((checksum, action, 0x41, len(payload))) + payload
 
 
 class W100ManufacturerCluster(CustomCluster):
@@ -286,6 +278,7 @@ class W100ManufacturerCluster(CustomCluster):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         """Initialize the W100 manufacturer cluster."""
         super().__init__(*args, **kwargs)
+        self._frame_counter = 0
         for event_type in (AttributeReadEvent, AttributeReportedEvent):
             self.on_event(event_type.event_type, self._handle_attribute_event)
 
@@ -295,31 +288,26 @@ class W100ManufacturerCluster(CustomCluster):
         """Handle manufacturer attribute events."""
         if event.attribute_id == self.AttributeDefs.command_raw.id:
             self.create_catching_task(
-                self._handle_command_raw_report(bytes(event.value))
+                self._handle_command_raw(bytes(event.value))
             )
 
         if event.attribute_id == self.AttributeDefs.aqara_heartbeat.id:
-            self._handle_heartbeat(event.value)
+            self._handle_heartbeat(
+                event.value,
+                is_reported_event=isinstance(event, AttributeReportedEvent),
+            )
 
-    async def _handle_command_raw_report(self, payload: bytes) -> None:
-        """Process a command_raw report."""
+    async def _handle_command_raw(self, payload: bytes) -> None:
+        """Handle incoming command_raw attribute data."""
         thermostat = cast(W100ThermostatCluster, self.endpoint.w100_thermostat)
         if thermostat.THERMOSTAT_MARKER in payload:
             if payload.endswith(thermostat.THERMOSTAT_MARKER):
                 await thermostat.sync_thermostat()
-            else:
-                try:
-                    updates = thermostat.parse_thermostat_payload(payload)
-                except (ValueError, UnicodeDecodeError) as exc:
-                    self.debug(
-                        "Failed to parse thermostat payload %s: %s",
-                        payload.hex(),
-                        exc,
-                    )
-                else:
-                    if updates:
-                        thermostat.update_from_w100(updates)
-                        await thermostat.sync_thermostat()
+            elif not payload.endswith(thermostat.THERMOSTAT_MARKER + b"\x00\x00"):
+                updates = thermostat.parse_thermostat_payload(payload)
+                if updates:
+                    thermostat.update_from_w100(updates)
+                    await thermostat.sync_thermostat()
 
         # W100 reliably requests humidity but may skip temperature requests.
         # Send both cached external values on humidity request.
@@ -330,17 +318,23 @@ class W100ManufacturerCluster(CustomCluster):
             )
 
     async def write_command_raw(
-        self, value: bytes
+        self, payload: bytes, action: int
     ) -> list[list[foundation.WriteAttributesStatusRecord]]:
-        """Write a raw W100 command frame."""
+        """Build and write a W100 command frame."""
+        header = bytes((0xAA, 0x71, len(payload) + 3, 0x44, self._frame_counter))
+        checksum = (-sum(header)) & 0xFF
+        frame = header + bytes((checksum, action, 0x41, len(payload))) + payload
+
+        self._frame_counter = (self._frame_counter + 1) & 0xFF
+
         return await self.write_attributes(
-            {self.AttributeDefs.command_raw: value},
+            {self.AttributeDefs.command_raw: frame},
             manufacturer=AQARA_MFG_CODE,
             update_cache=False,
         )
 
-    def _handle_heartbeat(self, data: bytes) -> None:
-        """Parse W100 heartbeat and update battery percentage."""
+    def _handle_heartbeat(self, data: bytes, *, is_reported_event: bool) -> None:
+        """Parse W100 heartbeat and update attributes."""
 
         while len(data) >= 2:
             tag = data[0]
@@ -359,14 +353,108 @@ class W100ManufacturerCluster(CustomCluster):
 
             if tag == 0x66:
                 self.endpoint.power.battery_percent_reported(value)
+            elif is_reported_event:
+                if tag == 0x64:
+                    self.endpoint.temperature.update_attribute(
+                        self.endpoint.temperature.AttributeDefs.measured_value.id,
+                        value,
+                    )
+                elif tag == 0x65:
+                    self.endpoint.humidity.update_attribute(
+                        self.endpoint.humidity.AttributeDefs.measured_value.id,
+                        value,
+                    )
 
     async def apply_custom_configuration(self, *args: Any, **kwargs: Any) -> None:
-        """Read mode flags and heartbeat during device configuration."""
+        """Read device attributes during configuration."""
         try:
-            await self.read_attributes([self.AttributeDefs.mode_flags.id])
-            await self.read_attributes([self.AttributeDefs.aqara_heartbeat.id])
+            await self.read_attributes(
+                [
+                    attr.id
+                    for attr in self.AttributeDefs
+                    if attr.id != self.AttributeDefs.command_raw.id
+                ]
+            )
+            for cluster in (self.endpoint.temperature, self.endpoint.humidity):
+                await cluster.read_attributes([cluster.AttributeDefs.measured_value.id])
         except Exception as exc:  # noqa: BLE001
             self.debug("Failed to read attributes: %s", exc, exc_info=True)
+
+
+class W100ThermostatControlSwitch(ConfigurableAttributeSwitch):
+    """W100 thermostat control switch."""
+
+    _attribute_name = W100ManufacturerCluster.AttributeDefs.mode_flags.name
+
+    @property
+    def is_on(self) -> bool:
+        """Return if thermostat control is enabled on the device."""
+        return bool(self._cluster.get(self._attribute_name) & THERMOSTAT_ON_BIT)
+
+    async def async_turn_on_off(self, state: bool) -> None:
+        """Turn thermostat control on or off."""
+        ieee = self._cluster.endpoint.device.ieee.serialize()[::-1]
+        hub_mac = ieee[:6]
+        payload = bytes.fromhex("6891000018") + ieee
+        if state:
+            payload += (
+                b"\x00\x00"
+                + hub_mac
+                + bytes.fromhex("08000844150a0109e7a9bae8b083e58a9f000000000001012a40")
+            )
+        else:
+            payload += bytes(12)
+
+        action = 0x02 if state else 0x04
+        result = await self._cluster.write_command_raw(payload, action)
+        status = result[0][0].status
+
+        if status is not foundation.Status.SUCCESS:
+            raise ZHAException(
+                f"Failed to turn thermostat control {'on' if state else 'off'}: {status}"
+            )
+
+
+class W100ExternalSensorSwitch(ConfigurableAttributeSwitch):
+    """W100 external sensor switch."""
+
+    _attribute_name = W100ManufacturerCluster.AttributeDefs.mode_flags.name
+
+    @property
+    def is_on(self) -> bool:
+        """Return if external sensor mode is enabled on the device."""
+        return bool(self._cluster.get(self._attribute_name) & EXTERNAL_SENSOR_ON_BIT)
+
+    async def async_turn_on_off(self, state: bool) -> None:
+        """Turn external sensor mode on or off."""
+        ieee = self._cluster.endpoint.device.ieee.serialize()[::-1]
+        virtual_sensor_ieee = ieee[:-1] + bytes([ieee[-1] ^ 0x01])
+        timestamp = int(time.time()).to_bytes(4, "big")
+
+        humidity = (
+            b"\x15",
+            bytes.fromhex("00020055150a0100000106e6b9bfe5baa6000000000001020865"),
+        )
+        temperature = (
+            b"\x14",
+            bytes.fromhex("00010055150a0100000106e6b8a9e5baa6000000000001020763"),
+        )
+
+        action = 0x02 if state else 0x04
+        for channel, suffix in (humidity, temperature):
+            payload = timestamp + channel + ieee
+            if state:
+                payload += virtual_sensor_ieee + suffix
+            else:
+                payload += bytes(12)
+
+            result = await self._cluster.write_command_raw(payload, action)
+            status = result[0][0].status
+
+            if status is not foundation.Status.SUCCESS:
+                raise ZHAException(
+                    f"Failed to turn {'on' if state else 'off'} external sensor: {status}"
+                )
 
 
 class W100ThermostatCluster(LocalDataCluster):
@@ -384,17 +472,17 @@ class W100ThermostatCluster(LocalDataCluster):
             manufacturer_code=None,
         )
         target_temperature: Final = ZCLAttributeDef(
-            id=0x5007,
+            id=0x5002,
             type=t.Single,
             manufacturer_code=None,
         )
         fan_mode: Final = ZCLAttributeDef(
-            id=0x5005,
+            id=0x5003,
             type=Fan.FanMode,
             manufacturer_code=None,
         )
         last_active_mode: Final = ZCLAttributeDef(
-            id=0x5006,
+            id=0x5004,
             type=Thermostat.SystemMode,
             manufacturer_code=None,
         )
@@ -426,88 +514,97 @@ class W100ThermostatCluster(LocalDataCluster):
         AttributeDefs.last_active_mode.id: Thermostat.SystemMode.Heat,
     }
 
-    _TARGET_TEMPERATURE_SYNC_MODES = {
-        Thermostat.SystemMode.Heat,
-        Thermostat.SystemMode.Cool,
-    }
+    def parse_thermostat_payload(self, payload: bytes) -> dict[str, Any]:
+        """Decode W100 thermostat parameters into local state values."""
+        try:
+            data = payload.split(self.THERMOSTAT_MARKER, 1)[1]
+            raw_value, _ = t.LVBytes.deserialize(data)
+            updates: dict[str, Any] = {}
 
-    @classmethod
-    def parse_thermostat_payload(cls, payload: bytes) -> dict[str, int | float]:
-        """Parse thermostat updates from a W100 payload."""
-        data = payload.split(cls.THERMOSTAT_MARKER, 1)[1]
-        raw_value, _ = t.LVBytes.deserialize(data)
-        updates: dict[str, int | float] = {}
+            for parameter in bytes(raw_value).decode("ascii").rstrip("\x00").split("_"):
+                key, value = parameter[0].upper(), parameter[1:]
 
-        for part in bytes(raw_value).decode("ascii").rstrip("\x00").split("_"):
-            if len(part) < 2:
-                continue
-            key, value = part[0].lower(), part[1:]
-            if key == "t":
-                updates[key] = float(value)
-            elif key in ("p", "m", "s"):
-                updates[key] = int(value)
+                if key == "P":
+                    power = int(value)
+                    if power in (0, 1):
+                        updates["is_off"] = bool(power)
+                elif key == "M":
+                    updates["system_mode"] = self.W100_MODE_TO_SYSTEM_MODE[int(value)]
+                elif key == "T":
+                    updates["temperature"] = float(value)
+                elif key == "S":
+                    updates["fan_mode"] = self.W100_FAN_MODE_TO_FAN_MODE[int(value)]
+                else:
+                    self.debug(
+                        "Unknown key in command_raw payload: %r, value: %r", key, value
+                    )
+
+        except (ValueError, UnicodeDecodeError, IndexError, KeyError) as exc:
+            self.debug("Failed to parse command_raw payload %s: %s", payload.hex(), exc)
+            return {}
 
         return updates
 
-    def update_from_w100(self, updates: dict[str, int | float]) -> None:
-        """Apply W100 thermostat updates to local attributes."""
-        if "m" in updates:
-            m = self.W100_MODE_TO_SYSTEM_MODE[updates["m"]]
-            self._update_attribute(self.AttributeDefs.system_mode.id, m)
-            self._update_attribute(self.AttributeDefs.last_active_mode.id, m)
+    def update_from_w100(self, updates: dict[str, Any]) -> None:
+        """Apply decoded W100 thermostat updates to local attributes."""
+        if "system_mode" in updates or "is_off" in updates:
+            if "system_mode" in updates:
+                self._update_attribute(
+                    self.AttributeDefs.last_active_mode.id, updates["system_mode"]
+                )
 
-        if "t" in updates:
-            self._update_attribute(
-                self.AttributeDefs.target_temperature.id,
-                round(float(updates["t"]), 1),
-            )
-
-        if "s" in updates:
-            self._update_attribute(
-                self.AttributeDefs.fan_mode.id,
-                self.W100_FAN_MODE_TO_FAN_MODE[updates["s"]],
-            )
-
-        if updates.get("p") == 1:
             self._update_attribute(
                 self.AttributeDefs.system_mode.id,
-                Thermostat.SystemMode.Off,
+                Thermostat.SystemMode.Off
+                if updates.get("is_off")
+                else self.get(self.AttributeDefs.last_active_mode.id),
             )
-        elif updates.get("p") == 0:
+
+        if "temperature" in updates:
             self._update_attribute(
-                self.AttributeDefs.system_mode.id,
-                self.get(self.AttributeDefs.last_active_mode.id),
+                self.AttributeDefs.target_temperature.id, updates["temperature"]
             )
+
+        if "fan_mode" in updates:
+            self._update_attribute(self.AttributeDefs.fan_mode.id, updates["fan_mode"])
 
     async def sync_thermostat(self) -> None:
         """Sync the cached thermostat state to the W100."""
-        device_ieee = self.endpoint.device.ieee.serialize()[::-1]
+        ieee = self.endpoint.device.ieee.serialize()[::-1]
+        hub_mac = ieee[:6]
+        ascii_payload = self._encode_thermostat_state()
 
-        mode = self.get(self.AttributeDefs.system_mode.id)
-        power = 1 if mode == Thermostat.SystemMode.Off else 0
-
-        if power:
-            mode = self.get(self.AttributeDefs.last_active_mode.id)
-
-        temperature = self.get(self.AttributeDefs.target_temperature.id)
-        fan = self.get(self.AttributeDefs.fan_mode.id)
-
-        command = f"P{power}_M{self.SYSTEM_MODE_TO_W100_MODE[mode]}_T{temperature:g}"
-        if fan is not None and fan != Fan.FanMode.Off:
-            command += f"_S{self.FAN_MODE_TO_W100_FAN_MODE[fan]}"
-
-        ascii_payload = command.encode("ascii")
         payload = (
             b"\x00\x00"
-            + device_ieee[:6]
+            + hub_mac
             + self.THERMOSTAT_MARKER
             + bytes([len(ascii_payload)])
             + ascii_payload
             + b"\x00"
         )
-        await self.endpoint.w100_manu.write_command_raw(
-            _build_w100_frame(payload, 0x05)
+        await self.endpoint.w100_manu.write_command_raw(payload, 0x05)
+
+    def _encode_thermostat_state(self) -> bytes:
+        """Encode cached thermostat state as a W100 command."""
+        system_mode = self.get(self.AttributeDefs.system_mode.id)
+        fan_mode = self.get(self.AttributeDefs.fan_mode.id)
+
+        is_off = system_mode == Thermostat.SystemMode.Off
+        active_mode = (
+            self.get(self.AttributeDefs.last_active_mode.id) if is_off else system_mode
         )
+        temperature = self.get(self.AttributeDefs.target_temperature.id)
+
+        state_text = "P1" if is_off else "P0"
+        state_text += (
+            f"_M{self.SYSTEM_MODE_TO_W100_MODE[active_mode]}"
+            f"_T{int(temperature)}"
+        )
+
+        if fan_mode in self.FAN_MODE_TO_W100_FAN_MODE:
+            state_text += f"_S{self.FAN_MODE_TO_W100_FAN_MODE[fan_mode]}"
+
+        return state_text.encode("ascii")
 
     async def write_attributes(
         self,
@@ -521,29 +618,27 @@ class W100ThermostatCluster(LocalDataCluster):
         system_mode_id = self.AttributeDefs.system_mode.id
         system_mode = self.get(system_mode_id)
 
-        if system_mode_id in attrids and system_mode != Thermostat.SystemMode.Off:
-            self._update_attribute(
-                self.AttributeDefs.last_active_mode.id,
-                system_mode,
-            )
-
-        should_sync = (
-            system_mode_id in attrids
-            or (
-                self.AttributeDefs.target_temperature.id in attrids
-                and system_mode in self._TARGET_TEMPERATURE_SYNC_MODES
-            )
-            or (
-                self.AttributeDefs.fan_mode.id in attrids
-                and system_mode != Thermostat.SystemMode.Off
-            )
+        mode_changed = system_mode_id in attrids
+        temperature_changed = (
+            system_mode in (Thermostat.SystemMode.Heat, Thermostat.SystemMode.Cool)
+            and self.AttributeDefs.target_temperature.id in attrids
         )
-        if should_sync:
-            mode_flags = self.endpoint.w100_manu.get(
-                W100ManufacturerCluster.AttributeDefs.mode_flags.id
-            )
-            if mode_flags is not None and (mode_flags & THERMOSTAT_ON_BIT):
-                self.create_catching_task(self.sync_thermostat())
+        fan_changed = (
+            self.AttributeDefs.fan_mode.id in attrids
+            and system_mode != Thermostat.SystemMode.Off
+        )
+
+        if mode_changed and system_mode != Thermostat.SystemMode.Off:
+            self._update_attribute(self.AttributeDefs.last_active_mode.id, system_mode)
+
+        if not (mode_changed or temperature_changed or fan_changed):
+            return result
+
+        mode_flags = self.endpoint.w100_manu.get(
+            W100ManufacturerCluster.AttributeDefs.mode_flags.id
+        )
+        if mode_flags is not None and mode_flags & THERMOSTAT_ON_BIT:
+            self.create_catching_task(self.sync_thermostat())
 
         return result
 
@@ -579,7 +674,7 @@ class W100ExternalSensorCluster(LocalDataCluster):
     async def sync_external_sensor(self, *attrids: int) -> None:
         """Sync selected cached external sensor values to the W100."""
         device_ieee = self.endpoint.device.ieee.serialize()[::-1]
-        fictive_sensor_mac = device_ieee[:-1] + bytes([device_ieee[-1] ^ 0x01])
+        virtual_sensor_ieee = device_ieee[:-1] + bytes([device_ieee[-1] ^ 0x01])
 
         for attrid in attrids:
             if attrid == self.AttributeDefs.external_humidity.id:
@@ -590,11 +685,9 @@ class W100ExternalSensorCluster(LocalDataCluster):
                 continue
 
             payload = (
-                fictive_sensor_mac + marker + struct.pack(">f", float(self.get(attrid)))
+                virtual_sensor_ieee + marker + struct.pack(">f", float(self.get(attrid)))
             )
-            await self.endpoint.w100_manu.write_command_raw(
-                _build_w100_frame(payload, 0x05)
-            )
+            await self.endpoint.w100_manu.write_command_raw(payload, 0x05)
 
     async def write_attributes(
         self,
@@ -623,107 +716,11 @@ class W100ExternalSensorCluster(LocalDataCluster):
         return result
 
 
-class W100ThermostatControlSwitch(ConfigurableAttributeSwitch):
-    """W100 thermostat control switch."""
-
-    _attribute_name = W100ManufacturerCluster.AttributeDefs.mode_flags.name
-
-    @property
-    def is_on(self) -> bool:
-        """Return if thermostat control is enabled on the device."""
-        mode_flags = self._cluster.get(self._attribute_name)
-        return bool(mode_flags and mode_flags & THERMOSTAT_ON_BIT)
-
-    async def async_turn_on_off(self, state: bool) -> None:
-        """Turn thermostat control on or off."""
-        ieee = self._cluster.endpoint.device.ieee.serialize()[::-1]
-        payload = bytes.fromhex("6891000018") + ieee
-        if state:
-            payload += (
-                b"\x00\x00"
-                + ieee[:6]
-                + bytes.fromhex("08000844150a0109e7a9bae8b083e58a9f000000000001012a40")
-            )
-        else:
-            payload += bytes(12)
-
-        action = 0x02 if state else 0x04
-        result = await self._cluster.write_command_raw(
-            _build_w100_frame(payload, action)
-        )
-        status = result[0][0].status
-
-        if status is not foundation.Status.SUCCESS:
-            raise ZHAException(
-                f"Failed to turn thermostat control {'on' if state else 'off'}: {status}"
-            )
-
-
-class W100ExternalSensorSwitch(ConfigurableAttributeSwitch):
-    """W100 external sensor switch."""
-
-    _attribute_name = W100ManufacturerCluster.AttributeDefs.mode_flags.name
-
-    @property
-    def is_on(self) -> bool:
-        """Return if external sensor mode is enabled on the device."""
-        mode_flags = self._cluster.get(self._attribute_name)
-        return bool(mode_flags and mode_flags & EXTERNAL_SENSOR_ON_BIT)
-
-    async def async_turn_on_off(self, state: bool) -> None:
-        """Turn external sensor mode on or off."""
-        ieee = self._cluster.endpoint.device.ieee.serialize()[::-1]
-        sensor_mac = ieee[:-1] + bytes([ieee[-1] ^ 0x01])
-        timestamp = int(time.time()).to_bytes(4, "big")
-
-        humidity = (
-            b"\x15",
-            bytes.fromhex("00020055150a0100000106e6b9bfe5baa6000000000001020865"),
-        )
-        temperature = (
-            b"\x14",
-            bytes.fromhex("00010055150a0100000106e6b8a9e5baa6000000000001020763"),
-        )
-
-        action = 0x02 if state else 0x04
-        for channel, suffix in (humidity, temperature):
-            payload = timestamp + channel + ieee
-            if state:
-                payload += sensor_mac + suffix
-            else:
-                payload += bytes(12)
-
-            result = await self._cluster.write_command_raw(
-                _build_w100_frame(payload, action)
-            )
-            status = result[0][0].status
-
-            if status is not foundation.Status.SUCCESS:
-                raise ZHAException(
-                    f"Failed to turn {'on' if state else 'off'} external sensor: {status}"
-                )
-
-
 class W100ClimateEntity(BaseThermostat, ZclPlatformEntity):
     """W100 climate entity backed by the W100 thermostat cluster."""
 
     DEFAULT_MIN_TEMP: Final = 4.5
     DEFAULT_MAX_TEMP: Final = 37
-
-    HVAC_MODES: Final[list[HVACMode]] = [
-        HVACMode.OFF,
-        HVACMode.HEAT,
-        HVACMode.COOL,
-        HVACMode.AUTO,
-    ]
-
-    FAN_MODES: Final[list[str]] = [
-        FAN_OFF,
-        FAN_AUTO,
-        FAN_LOW,
-        FAN_MEDIUM,
-        FAN_HIGH,
-    ]
 
     SYSTEM_MODE_TO_HVAC: Final = {
         Thermostat.SystemMode.Off: HVACMode.OFF,
@@ -736,6 +733,8 @@ class W100ClimateEntity(BaseThermostat, ZclPlatformEntity):
         value: key for key, value in SYSTEM_MODE_TO_HVAC.items()
     }
 
+    HVAC_MODES: Final[list[HVACMode]] = list(HVAC_TO_SYSTEM_MODE)
+
     FAN_MODE_TO_ZCL: Final = {
         FAN_OFF: Fan.FanMode.Off,
         FAN_AUTO: Fan.FanMode.Auto,
@@ -745,6 +744,8 @@ class W100ClimateEntity(BaseThermostat, ZclPlatformEntity):
     }
 
     ZCL_TO_FAN_MODE: Final = {value: key for key, value in FAN_MODE_TO_ZCL.items()}
+
+    FAN_MODES: Final[list[str]] = list(FAN_MODE_TO_ZCL)
 
     def on_add(self) -> None:
         """Run when entity is added."""
@@ -776,7 +777,11 @@ class W100ClimateEntity(BaseThermostat, ZclPlatformEntity):
 
     @property
     def available(self) -> bool:
-        """Return entity availability."""
+        """Keep the virtual thermostat available while W100 is unavailable.
+
+        Allow it to receive and retain state changes for synchronization
+        when W100 becomes available again.
+        """
         return True
 
     @property
@@ -787,64 +792,41 @@ class W100ClimateEntity(BaseThermostat, ZclPlatformEntity):
         ]
 
     @property
-    def _local_temperature(self) -> int | None:
-        """Return measured temperature in centi-degrees."""
-        return self._temperature_cluster.get(
+    def current_temperature(self) -> float | None:
+        """Return the current temperature."""
+        temperature = self._temperature_cluster.get(
             TemperatureMeasurement.AttributeDefs.measured_value.name
         )
+        return None if temperature is None else temperature / ZCL_TEMP
 
     @property
-    def _system_mode(self) -> SystemMode | None:
-        """Return cached W100 system mode."""
-        return self._cluster.get(W100ThermostatCluster.AttributeDefs.system_mode.name)
-
-    @property
-    def _target_temperature(self) -> float | None:
-        """Return cached target temperature in degrees Celsius."""
+    def target_temperature(self) -> float | None:
+        """Return the temperature we try to reach."""
         return self._cluster.get(
             W100ThermostatCluster.AttributeDefs.target_temperature.name
         )
 
     @property
-    def _fan_mode(self) -> FanMode | None:
-        """Return cached fan mode."""
-        return self._cluster.get(W100ThermostatCluster.AttributeDefs.fan_mode.name)
-
-    @property
-    def current_temperature(self) -> float | None:
-        """Return the current temperature."""
-        temperature = self._local_temperature
-
-        if temperature is None:
-            return None
-
-        return temperature / ZCL_TEMP
-
-    @property
-    def target_temperature(self) -> float | None:
-        """Return the temperature we try to reach."""
-        return self._target_temperature
-
-    @property
-    def target_temperature_high(self) -> float | None:
+    def target_temperature_high(self) -> None:
         """Return the upper bound temperature we try to reach."""
         return None
 
     @property
-    def target_temperature_low(self) -> float | None:
+    def target_temperature_low(self) -> None:
         """Return the lower bound temperature we try to reach."""
         return None
 
     @property
-    def outdoor_temperature(self) -> float | None:
+    def outdoor_temperature(self) -> None:
         """Return the outdoor temperature."""
         return None
 
     @property
     def hvac_mode(self) -> HVACMode | None:
         """Return HVAC operation mode."""
-        mode = self._system_mode
-        return self.SYSTEM_MODE_TO_HVAC.get(mode) if mode is not None else None
+        return self.SYSTEM_MODE_TO_HVAC.get(
+            self._cluster.get(W100ThermostatCluster.AttributeDefs.system_mode.name)
+        )
 
     @property
     def hvac_modes(self) -> list[HVACMode]:
@@ -852,15 +834,17 @@ class W100ClimateEntity(BaseThermostat, ZclPlatformEntity):
         return self.HVAC_MODES
 
     @property
-    def hvac_action(self) -> HVACAction | None:
+    def hvac_action(self) -> None:
         """Return the current HVAC action."""
         return None
 
     @property
-    def fan_mode(self) -> str | None:
+    def fan_mode(self) -> str:
         """Return current FAN mode."""
-        mode = self._fan_mode
-        return self.ZCL_TO_FAN_MODE.get(mode, FAN_OFF) if mode is not None else FAN_OFF
+        return self.ZCL_TO_FAN_MODE.get(
+            self._cluster.get(W100ThermostatCluster.AttributeDefs.fan_mode.name),
+            FAN_OFF,
+        )
 
     @property
     def fan_modes(self) -> list[str]:
@@ -868,12 +852,12 @@ class W100ClimateEntity(BaseThermostat, ZclPlatformEntity):
         return self.FAN_MODES
 
     @property
-    def preset_mode(self) -> str | None:
+    def preset_mode(self) -> None:
         """Return current preset mode."""
         return None
 
     @property
-    def preset_modes(self) -> list[str] | None:
+    def preset_modes(self) -> None:
         """Return supported preset modes."""
         return None
 
@@ -902,12 +886,9 @@ class W100ClimateEntity(BaseThermostat, ZclPlatformEntity):
         if hvac_mode not in self.hvac_modes:
             return
 
+        system_mode = self.HVAC_TO_SYSTEM_MODE[hvac_mode]
         await self._cluster.write_attributes(
-            {
-                W100ThermostatCluster.AttributeDefs.system_mode.name: self.HVAC_TO_SYSTEM_MODE[
-                    hvac_mode
-                ],
-            }
+            {W100ThermostatCluster.AttributeDefs.system_mode.name: system_mode}
         )
 
     async def async_set_temperature(
@@ -929,14 +910,15 @@ class W100ClimateEntity(BaseThermostat, ZclPlatformEntity):
             )
 
         if temperature is not None:
-            attributes[W100ThermostatCluster.AttributeDefs.target_temperature.name] = (
-                temperature
-            )
+            mode = hvac_mode if hvac_mode is not None else self.hvac_mode
+
+            if mode in (HVACMode.HEAT, HVACMode.COOL):
+                attributes[
+                    W100ThermostatCluster.AttributeDefs.target_temperature.name
+                ] = temperature
 
         if not attributes:
-            self._cluster.debug(
-                "incorrect temperature setting for '%s' mode", self.hvac_mode
-            )
+            self.debug("incorrect temperature setting for '%s' mode", self.hvac_mode)
             return
 
         await self._cluster.write_attributes(attributes)
@@ -956,7 +938,7 @@ class W100ClimateEntity(BaseThermostat, ZclPlatformEntity):
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:
         """Set new preset mode."""
-        self._cluster.debug("Preset mode '%s' is not supported", preset_mode)
+        self.debug("Preset mode '%s' is not supported", preset_mode)
 
 
 (
@@ -991,7 +973,6 @@ class W100ClimateEntity(BaseThermostat, ZclPlatformEntity):
         cluster_id=W100ThermostatCluster.cluster_id,
         entity_type=EntityType.STANDARD,
         unique_id_suffix="thermostat",
-        force_create=True,
         translation_key="thermostat",
         fallback_name="Thermostat",
     )
@@ -1001,7 +982,6 @@ class W100ClimateEntity(BaseThermostat, ZclPlatformEntity):
         cluster_id=W100ManufacturerCluster.cluster_id,
         entity_type=EntityType.CONFIG,
         unique_id_suffix="thermostat_control",
-        force_create=True,
         translation_key="thermostat_control",
         fallback_name="Thermostat control",
     )
@@ -1011,7 +991,6 @@ class W100ClimateEntity(BaseThermostat, ZclPlatformEntity):
         cluster_id=W100ManufacturerCluster.cluster_id,
         entity_type=EntityType.CONFIG,
         unique_id_suffix="external_sensor",
-        force_create=True,
         translation_key="external_sensor",
         fallback_name="External sensor",
     )
@@ -1198,5 +1177,6 @@ class W100ClimateEntity(BaseThermostat, ZclPlatformEntity):
         translation_key="humidity_report_threshold",
         fallback_name="Humidity report threshold",
     )
+    .skip_configuration()
     .add_to_registry()
 )
