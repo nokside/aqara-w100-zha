@@ -430,7 +430,15 @@ actions:
             {% else %}
               {{ state_attr(linked, 'current_humidity') | int }}
             {% endif %}
-          ext_hum_entity: "{{ device_entities(device_id(w100)) | select('match', 'number[.].*_external_humidity$') | first | default('') }}"
+          ext_hum_entity: >-
+            {% set identifier = device_attr(device_id(w100), 'identifiers') | first %}
+            {% set external = (identifier[0], identifier[1] ~ '-external_sensor') %}
+            {%- for entity in states.number | selectattr('attributes.device_class', 'eq', 'humidity') %}
+              {%- if external in device_attr(entity.entity_id, 'identifiers') | default([], true) %}
+                {{- entity.entity_id -}}
+                {%- break %}
+              {%- endif %}
+            {%- endfor %}
 
       - condition: template
         value_template: "{{ states(ext_hum_entity) | is_number }}"
@@ -475,8 +483,15 @@ actions:
             {% else %}
               {{ state_attr(linked, 'current_temperature') | float }}
             {% endif %}
-          ext_temp_entity: "{{ device_entities(device_id(w100)) | select('match', 'number[.].*_external_temperature$') | first | default('') }}"
-
+          ext_temp_entity: >-
+            {% set identifier = device_attr(device_id(w100), 'identifiers') | first %}
+            {% set external = (identifier[0], identifier[1] ~ '-external_sensor') %}
+            {%- for entity in states.number | selectattr('attributes.device_class', 'eq', 'temperature') %}
+              {%- if external in device_attr(entity.entity_id, 'identifiers') | default([], true) %}
+                {{- entity.entity_id -}}
+                {%- break %}
+              {%- endif %}
+            {%- endfor %}
       - condition: template
         value_template: "{{ states(ext_temp_entity) | is_number }}"
 
