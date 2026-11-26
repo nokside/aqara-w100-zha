@@ -700,15 +700,6 @@ class W100ClimateEntity(BaseThermostat, ZclPlatformEntity):
         self.maybe_emit_state_changed_event()
 
     @property
-    def available(self) -> bool:
-        """Keep the virtual thermostat available while W100 is unavailable.
-
-        Allow it to receive and retain state changes for synchronization
-        when W100 becomes available again.
-        """
-        return True
-
-    @property
     def _temperature_cluster(self) -> TemperatureMeasurement:
         """Return temperature measurement cluster."""
         return self.endpoint.zigpy_endpoint.in_clusters[
@@ -797,12 +788,16 @@ class W100ClimateEntity(BaseThermostat, ZclPlatformEntity):
     @property
     def supported_features(self) -> ClimateEntityFeature:
         """Return the list of supported features."""
-        return (
+        features = (
             ClimateEntityFeature.TARGET_TEMPERATURE
-            | ClimateEntityFeature.FAN_MODE
             | ClimateEntityFeature.TURN_OFF
             | ClimateEntityFeature.TURN_ON
         )
+
+        if not self._cluster.get(W100ThermostatCluster.AttributeDefs.fan_hide.id):
+            features |= ClimateEntityFeature.FAN_MODE
+
+        return features
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """Set new HVAC operation mode."""
@@ -862,14 +857,14 @@ class W100ClimateEntity(BaseThermostat, ZclPlatformEntity):
     QuirkBuilder("Aqara", "lumi.sensor_ht.agl001")
     .friendly_name(manufacturer="Aqara", model="Climate Sensor W100")
     .child_device(
-        "thermostat",
-        translation_key="thermostat_link",
-        fallback_name="Thermostat link",
+        "hvac_remote_control",
+        translation_key="hvac_remote_control",
+        fallback_name="HVAC remote control",
     )
     .child_device(
         "external_sensor",
-        translation_key="external_sensor_link",
-        fallback_name="External sensor link",
+        translation_key="external_sensor",
+        fallback_name="External sensor",
     )
     .replaces(W100PowerConfigurationCluster)
     .replaces(W100ManufacturerCluster)
@@ -892,12 +887,6 @@ class W100ClimateEntity(BaseThermostat, ZclPlatformEntity):
             (LONG_RELEASE, "minus"): {COMMAND: COMMAND_3_RELEASE},
         }
     )
-    # Each button reports on its own endpoint. It counts its presses itself, reports a
-    # hold at the hold threshold and the release after it (Zigbee2MQTT TH-S04D: hold 0,
-    # single 1, double 2, release 255). Whether the hold is repeated while the button
-    # stays down is not confirmed, so repeats are allowed, and the release only ends a
-    # hold seen, in case it also follows other presses. Nothing is sent while the
-    # device is in thermostat mode.
     .button_event(
         events=[
             ButtonEvent(
@@ -993,9 +982,9 @@ class W100ClimateEntity(BaseThermostat, ZclPlatformEntity):
         cluster_id=W100ThermostatCluster.cluster_id,
         entity_type=EntityType.STANDARD,
         unique_id_suffix="thermostat",
-        translation_key="thermostat",
-        fallback_name="Thermostat",
-        child_device_id="thermostat",
+        translation_key="hvac_remote",
+        fallback_name="HVAC remote",
+        child_device_id="hvac_remote_control",
     )
     .adds_entity(
         W100ThermostatControlSwitch,
@@ -1005,26 +994,25 @@ class W100ClimateEntity(BaseThermostat, ZclPlatformEntity):
         unique_id_suffix="thermostat_control",
         translation_key="remote_control",
         fallback_name="Remote control",
-        child_device_id="thermostat",
+        child_device_id="hvac_remote_control",
     )
-    .adds_entity(
-        W100ExternalSensorSwitch,
-        endpoint_id=1,
-        cluster_id=W100ManufacturerCluster.cluster_id,
-        entity_type=EntityType.CONFIG,
-        unique_id_suffix="external_sensor",
-        translation_key="external_sensor",
-        fallback_name="External sensor",
-        child_device_id="external_sensor",
+    .switch(
+        attribute_name="fan_hide",
+        cluster_id=W100ThermostatCluster.cluster_id,
+        on_value=0,
+        off_value=1,
+        translation_key="fan_control_support",
+        fallback_name="Fan control support",
+        child_device_id="hvac_remote_control",
     )
     .switch(
         attribute_name="thermostat_line_auto_hide",
         cluster_id=W100ManufacturerCluster.cluster_id,
         on_value=0,
         off_value=1,
-        translation_key="thermostat_line_auto_hide",
-        fallback_name="Thermostat line auto-hide",
-        child_device_id="thermostat",
+        translation_key="auto_hide_control_bar",
+        fallback_name="Auto-hide control bar",
+        child_device_id="hvac_remote_control",
     )
     .number(
         attribute_name="external_temperature",
@@ -1037,7 +1025,6 @@ class W100ClimateEntity(BaseThermostat, ZclPlatformEntity):
         multiplier=0.01,
         unit=UnitOfTemperature.CELSIUS,
         mode=NumberMode.BOX,
-        translation_key="temperature",
         fallback_name="Temperature",
         child_device_id="external_sensor",
     )
@@ -1052,8 +1039,17 @@ class W100ClimateEntity(BaseThermostat, ZclPlatformEntity):
         multiplier=0.01,
         unit=PERCENTAGE,
         mode=NumberMode.BOX,
-        translation_key="humidity",
         fallback_name="Humidity",
+        child_device_id="external_sensor",
+    )
+    .adds_entity(
+        W100ExternalSensorSwitch,
+        endpoint_id=1,
+        cluster_id=W100ManufacturerCluster.cluster_id,
+        entity_type=EntityType.CONFIG,
+        unique_id_suffix="external_sensor",
+        translation_key="show_on_display",
+        fallback_name="Show on display",
         child_device_id="external_sensor",
     )
     .number(
@@ -1065,6 +1061,7 @@ class W100ClimateEntity(BaseThermostat, ZclPlatformEntity):
         step=0.5,
         multiplier=0.01,
         unit=UnitOfTemperature.CELSIUS,
+        mode=NumberMode.BOX,
         translation_key="comfort_temperature_max",
         fallback_name="Comfort temperature max",
     )
@@ -1077,6 +1074,7 @@ class W100ClimateEntity(BaseThermostat, ZclPlatformEntity):
         step=0.5,
         multiplier=0.01,
         unit=UnitOfTemperature.CELSIUS,
+        mode=NumberMode.BOX,
         translation_key="comfort_temperature_min",
         fallback_name="Comfort temperature min",
     )
@@ -1089,6 +1087,7 @@ class W100ClimateEntity(BaseThermostat, ZclPlatformEntity):
         step=1.0,
         multiplier=0.01,
         unit=PERCENTAGE,
+        mode=NumberMode.BOX,
         translation_key="comfort_humidity_max",
         fallback_name="Comfort humidity max",
     )
@@ -1101,6 +1100,7 @@ class W100ClimateEntity(BaseThermostat, ZclPlatformEntity):
         step=1.0,
         multiplier=0.01,
         unit=PERCENTAGE,
+        mode=NumberMode.BOX,
         translation_key="comfort_humidity_min",
         fallback_name="Comfort humidity min",
     )
@@ -1202,15 +1202,6 @@ class W100ClimateEntity(BaseThermostat, ZclPlatformEntity):
         unit=PERCENTAGE,
         translation_key="humidity_report_threshold",
         fallback_name="Humidity report threshold",
-    )
-    .switch(
-        attribute_name="fan_hide",
-        cluster_id=W100ThermostatCluster.cluster_id,
-        on_value=0,
-        off_value=1,
-        translation_key="show_fan",
-        fallback_name="Show fan",
-        child_device_id="thermostat",
     )
     .skip_configuration()
     .add_to_registry()
