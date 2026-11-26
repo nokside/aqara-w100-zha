@@ -12,7 +12,7 @@ blueprint:
   source_url: https://raw.githubusercontent.com/nokside/aqara-w100-zha/main/w100-blueprint.yaml
   author: nokside
   homeassistant:
-    min_version: 2025.4.0
+    min_version: 2026.12.0
   input:
     w100_climate:
       name: Aqara W100
@@ -241,7 +241,7 @@ conditions:
                     id: fan
 
                   - condition: template
-                    value_template: "{{ trigger.to_state.attributes.get('fan_mode') | default('off', true) != state_attr(climate_target, 'fan_mode') | default('off', true) }}"
+                    value_template: "{{ trigger.to_state.attributes.get('fan_mode') != state_attr(climate_target, 'fan_mode') }}"
 
 actions:
   - alias: Sync climate
@@ -287,6 +287,9 @@ actions:
               - condition: template
                 value_template: "{{ needs_recovery }}"
 
+              - condition: template
+                value_template: "{{ states(linked) in (state_attr(w100, 'hvac_modes') or []) }}"
+
             then:
               - action: climate.set_hvac_mode
                 target:
@@ -301,6 +304,9 @@ actions:
               - temperature
               - mode
               - resync
+
+          - condition: template
+            value_template: "{{ (state_attr(climate_target, 'supported_features') | int(0) | bitwise_and(1)) != 0 }}"
 
           - condition: template
             value_template: "{{ state_attr(climate_source, 'temperature') is number }}"
@@ -361,11 +367,13 @@ actions:
               - resync
 
           - condition: template
+            value_template: "{{ (state_attr(climate_target, 'supported_features') | int(0) | bitwise_and(8)) != 0 }}"
+
+          - condition: template
             value_template: "{{ state_attr(climate_source, 'fan_mode') is not none }}"
 
           - condition: template
-            value_template: "{{ state_attr(climate_source, 'fan_mode') != state_attr(climate_target, 'fan_mode') | default('off', true) }}"
-
+            value_template: "{{ state_attr(climate_source, 'fan_mode') != state_attr(climate_target, 'fan_mode') }}"
         then:
           - variables:
               fan_mode: "{{ state_attr(climate_source, 'fan_mode') }}"
@@ -394,12 +402,15 @@ actions:
               - condition: template
                 value_template: "{{ needs_recovery }}"
 
+              - condition: template
+                value_template: "{{ state_attr(linked, 'fan_mode') in (state_attr(w100, 'fan_modes') or []) }}"
+
             then:
               - action: climate.set_fan_mode
                 target:
                   entity_id: "{{ w100 }}"
                 data:
-                  fan_mode: "{{ state_attr(linked, 'fan_mode') | default('off', true) }}"
+                  fan_mode: "{{ state_attr(linked, 'fan_mode') }}"
 
   - alias: Sync external humidity
     if:
